@@ -5,4 +5,5 @@ python train.py \
 --input_validation_file LibriTTS/val-full.txt \
 --list_input_unseen_wavs_dir LibriTTS LibriTTS \
 --list_input_unseen_validation_file LibriTTS/dev-clean.txt LibriTTS/dev-other.txt \
---checkpoint_path exp/16kbigvgan_full_128band
+--checkpoint_path exp/16kbigvgan_full_128band \
+--wandb

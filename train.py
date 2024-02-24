@@ -32,6 +32,11 @@ import auraloss
 torch.backends.cudnn.benchmark = False
 
 def train(rank, a, h):
+    if rank==0 and a.wandb:
+        import wandb
+        run_name = os.path.basename(os.path.abspath(a.checkpoint_path))
+        wandb.init(project="BigVGAN", name=run_name, sync_tensorboard=True)
+    
     if h.num_gpus > 1:
         # initialize distributed
         init_process_group(backend=h.dist_config['dist_backend'], init_method=h.dist_config['dist_url'],
@@ -419,6 +424,8 @@ def main():
                         help="skip seen dataset. useful for test set inference")
     parser.add_argument('--save_audio', default=False, type=bool,
                         help="save audio of test set inference to disk")
+    parser.add_argument( "--wandb", action="store_true",
+                        help="enable wandb")
 
     a = parser.parse_args()
 
