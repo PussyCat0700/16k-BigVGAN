@@ -56,7 +56,6 @@ def train(rank, a, h):
 
     # create or scan the latest checkpoint from checkpoints directory
     if rank == 0:
-        print(generator)
         os.makedirs(a.checkpoint_path, exist_ok=True)
         print("checkpoints directory : ", a.checkpoint_path)
 
@@ -157,7 +156,8 @@ def train(rank, a, h):
         val_mrstft_tot = 0
 
         # modules for evaluation metrics
-        pesq_resampler = ta.transforms.Resample(h.sampling_rate, 16000).cuda()
+        if h.sampling_rate != 16000:
+            pesq_resampler = ta.transforms.Resample(h.sampling_rate, 16000).cuda()
         loss_mrstft = auraloss.freq.MultiResolutionSTFTLoss(device="cuda")
 
         if a.save_audio: # also save audio to disk if --save_audio is set to True
@@ -183,9 +183,13 @@ def train(rank, a, h):
 
                 # PESQ calculation. only evaluate PESQ if it's speech signal (nonspeech PESQ will error out)
                 if not "nonspeech" in mode: # skips if the name of dataset (in mode string) contains "nonspeech"
-                    # resample to 16000 for pesq
-                    y_16k = pesq_resampler(y)
-                    y_g_hat_16k = pesq_resampler(y_g_hat.squeeze(1))
+                    if h.sampling_rate != 16000:
+                        # resample to 16000 for pesq
+                        y_16k = pesq_resampler(y)
+                        y_g_hat_16k = pesq_resampler(y_g_hat.squeeze(1))
+                    else:
+                        y_16k = y
+                        y_g_hat_16k = y_g_hat.squeeze(1)
                     y_int_16k = (y_16k[0] * MAX_WAV_VALUE).short().cpu().numpy()
                     y_g_hat_int_16k = (y_g_hat_16k[0] * MAX_WAV_VALUE).short().cpu().numpy()
                     val_pesq_tot += pesq(16000, y_int_16k, y_g_hat_int_16k, 'wb')

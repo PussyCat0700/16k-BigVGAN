@@ -65,7 +65,7 @@ def mel_spectrogram(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin,
 
     global mel_basis, hann_window
     if fmax not in mel_basis:
-        mel = librosa_mel_fn(sampling_rate, n_fft, num_mels, fmin, fmax)
+        mel = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax)
         mel_basis[str(fmax)+'_'+str(y.device)] = torch.from_numpy(mel).float().to(y.device)
         hann_window[str(y.device)] = torch.hann_window(win_size).to(y.device)
 
@@ -138,9 +138,9 @@ class MelDataset(torch.utils.data.Dataset):
         self.fine_tuning = fine_tuning
         self.base_mels_path = base_mels_path
 
-        print("INFO: checking dataset integrity...")
-        for i in tqdm(range(len(self.audio_files))):
-            assert os.path.exists(self.audio_files[i]), "{} not found".format(self.audio_files[i])
+        # print("INFO: checking dataset integrity...")
+        # for i in tqdm(range(len(self.audio_files))):
+        #     assert os.path.exists(self.audio_files[i]), "{} not found".format(self.audio_files[i])
 
     def __getitem__(self, index):
 

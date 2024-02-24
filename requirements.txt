@@ -1,6 +1,7 @@
-torch
-numpy
+torch==1.13
+torchaudio==0.13.0
 librosa==0.8.1
+numpy
 scipy
 tensorboard
 soundfile
