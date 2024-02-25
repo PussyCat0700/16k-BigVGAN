@@ -158,12 +158,12 @@ def train(rank, a, h):
 
         val_err_tot = 0
         val_pesq_tot = 0
-        val_mrstft_tot = 0
+        # val_mrstft_tot = 0
 
         # modules for evaluation metrics
         if h.sampling_rate != 16000:
             pesq_resampler = ta.transforms.Resample(h.sampling_rate, 16000).cuda()
-        loss_mrstft = auraloss.freq.MultiResolutionSTFTLoss(device="cuda")
+        # loss_mrstft = auraloss.freq.MultiResolutionSTFTLoss(device="cuda")
 
         if a.save_audio: # also save audio to disk if --save_audio is set to True
             os.makedirs(os.path.join(a.checkpoint_path, 'samples', 'gt_{}'.format(mode)), exist_ok=True)
@@ -200,7 +200,7 @@ def train(rank, a, h):
                     val_pesq_tot += pesq(16000, y_int_16k, y_g_hat_int_16k, 'wb')
 
                 # MRSTFT calculation
-                val_mrstft_tot += loss_mrstft(y_g_hat.squeeze(1), y).item()
+                # val_mrstft_tot += loss_mrstft(y_g_hat, y.unsqueeze()).item()
 
                 # log audio and figures to Tensorboard
                 if j % a.eval_subsample == 0:  # subsample every nth from validation set
@@ -227,11 +227,11 @@ def train(rank, a, h):
 
             val_err = val_err_tot / (j + 1)
             val_pesq = val_pesq_tot / (j + 1)
-            val_mrstft = val_mrstft_tot / (j + 1)
+            # val_mrstft = val_mrstft_tot / (j + 1)
             # log evaluation metrics to Tensorboard
             sw.add_scalar("validation_{}/mel_spec_error".format(mode), val_err, steps)
             sw.add_scalar("validation_{}/pesq".format(mode), val_pesq, steps)
-            sw.add_scalar("validation_{}/mrstft".format(mode), val_mrstft, steps)
+            # sw.add_scalar("validation_{}/mrstft".format(mode), val_mrstft, steps)
 
         generator.train()
 
