@@ -171,6 +171,8 @@ class BigVGAN(torch.nn.Module):
 
     def forward(self, x):
         # pre conv
+        # full [4, 1536, 51] -> [4, 768, (51-1)*5-2*2+10=256], ... 
+        # base [4, 512, 51] -> [4, 256, 510], [4, 128, 2040], [4, 64, 4080], [4, 32, 8160]
         x = self.conv_pre(x)
 
         for i in range(self.num_upsamples):

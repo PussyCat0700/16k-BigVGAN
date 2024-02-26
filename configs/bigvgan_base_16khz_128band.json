@@ -1,11 +1,12 @@
 {
     "resblock": "1",
     "num_gpus": 0,
-    "batch_size": 32,
-    "learning_rate": 0.0001,
+    "batch_size": 64,
+    "learning_rate": 0.0002,
     "adam_b1": 0.8,
     "adam_b2": 0.99,
     "lr_decay": 0.999,
+    "weight_decay": 0.00001,
     "seed": 1234,
 
     "upsample_rates": [10,4,2,2],
@@ -22,7 +23,7 @@
     "use_spectral_norm": false,
     "discriminator_channel_mult": 1,
 
-    "segment_size": 8192,
+    "segment_size": 8320,
     "num_mels": 128,
     "num_freq": 1025,
     "n_fft": 512,
