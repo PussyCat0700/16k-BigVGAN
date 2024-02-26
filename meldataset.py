@@ -147,7 +147,9 @@ class MelDataset(torch.utils.data.Dataset):
         filename = self.audio_files[index]
         if self._cache_ref_count == 0:
             audio, sampling_rate = load_wav(filename, self.sampling_rate)
-            audio = audio / MAX_WAV_VALUE
+            if np.issubdtype(audio.dtype, np.int16):
+                # The we we resample audio to 16kHz ensures this is not needed.
+                audio = audio / MAX_WAV_VALUE
             if not self.fine_tuning:
                 audio = normalize(audio) * 0.95
             self.cached_wav = audio
