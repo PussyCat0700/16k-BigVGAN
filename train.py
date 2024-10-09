@@ -5,6 +5,7 @@
 #   LICENSE is in incl_licenses directory.
 
 
+import math
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 import itertools
@@ -20,14 +21,13 @@ import torch.multiprocessing as mp
 from torch.distributed import init_process_group
 from torch.nn.parallel import DistributedDataParallel
 from env import AttrDict, build_env
-from meldataset import MelDataset, mel_spectrogram, get_dataset_filelist, MAX_WAV_VALUE
+from meldataset import MelDataset, LogMelSpectrogram, MAX_WAV_VALUE
 from models import BigVGAN, MultiPeriodDiscriminator, MultiResolutionDiscriminator,\
     feature_loss, generator_loss, discriminator_loss
 from utils import plot_spectrogram, plot_spectrogram_clipped, scan_checkpoint, load_checkpoint, save_checkpoint, save_audio
 import torchaudio as ta
 from pesq import pesq
 from tqdm import tqdm
-import auraloss
 
 torch.backends.cudnn.benchmark = False
 
@@ -46,6 +46,7 @@ def train(rank, a, h):
     torch.cuda.manual_seed(h.seed)
     torch.cuda.set_device(rank)
     device = torch.device('cuda:{:d}'.format(rank))
+    logmel = LogMelSpectrogram().to(rank)
 
     # define BigVGAN generator
     generator = BigVGAN(h).to(device)
@@ -162,16 +163,15 @@ def train(rank, a, h):
 
             # loop over validation set and compute metrics
             for j, batch in tqdm(enumerate(loader)):
-                x, y, _, y_mel = batch
+                y, x, y_mel = batch
                 y = y.to(device)
+                x = x.squeeze(1)
                 if hasattr(generator, 'module'):
                     y_g_hat = generator.module(x.to(device))
                 else:
                     y_g_hat = generator(x.to(device))
                 y_mel = y_mel.to(device, non_blocking=True)
-                y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate,
-                                              h.hop_size, h.win_size,
-                                              h.fmin, h.fmax_for_loss)
+                y_g_hat_mel = logmel(y_g_hat).squeeze(1)
                 val_err_tot += F.l1_loss(y_mel, y_g_hat_mel).item()
 
                 # PESQ calculation. only evaluate PESQ if it's speech signal (nonspeech PESQ will error out)
@@ -202,9 +202,7 @@ def train(rank, a, h):
                     if a.save_audio: # also save audio to disk if --save_audio is set to True
                         save_audio(y_g_hat[0, 0], os.path.join(a.checkpoint_path, 'samples', '{}_{:08d}'.format(mode, steps), '{:04d}.wav'.format(j)), h.sampling_rate)
                     # spectrogram of synthesized audio
-                    y_hat_spec = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels,
-                                                 h.sampling_rate, h.hop_size, h.win_size,
-                                                 h.fmin, h.fmax)
+                    y_hat_spec = logmel(y_g_hat.squeeze(1))
                     sw.add_figure('generated_{}/y_hat_spec_{}'.format(mode, j),
                                   plot_spectrogram(y_hat_spec.squeeze(0).cpu().numpy()), steps)
                     # visualization of spectrogram difference between GT and synthesized audio
@@ -236,7 +234,11 @@ def train(rank, a, h):
     generator.train()
     mpd.train()
     mrd.train()
-    for epoch in range(max(0, last_epoch), a.training_epochs):
+    
+    world_size = torch.cuda.device_count()
+    n_epochs = math.ceil(a.max_updates/(len(train_loader)*world_size))
+    print(f'******Model will be trained for {n_epochs=}******')
+    for epoch in range(max(0, last_epoch), n_epochs):
         if rank == 0:
             start = time.time()
             print("Epoch: {}".format(epoch+1))
@@ -247,16 +249,14 @@ def train(rank, a, h):
         for i, batch in enumerate(train_loader):
             if rank == 0:
                 start_b = time.time()
-            x, y, _, y_mel = batch
+            y, x, y_mel = batch
 
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             y_mel = y_mel.to(device, non_blocking=True)
-            y = y.unsqueeze(1)
-
+            x = x.squeeze(1)
             y_g_hat = generator(x)
-            y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size,
-                                          h.fmin, h.fmax_for_loss)
+            y_g_hat_mel = logmel(y_g_hat).squeeze(1)
 
             optim_d.zero_grad()
 
@@ -378,7 +378,7 @@ def main():
     parser.add_argument('--checkpoint_path', default='exp/bigvgan')
     parser.add_argument('--config', default='')
 
-    parser.add_argument('--training_epochs', default=100000, type=int)
+    parser.add_argument('--max_updates', help='max number of updates per GPU', type=int, default=400_000)
     parser.add_argument('--stdout_interval', default=5, type=int)
     parser.add_argument('--checkpoint_interval', default=50000, type=int)
     parser.add_argument('--summary_interval', default=100, type=int)
@@ -387,7 +387,7 @@ def main():
     parser.add_argument('--freeze_step', default=0, type=int,
                         help='freeze D for the first specified steps. G only uses regression loss for these steps.')
 
-    parser.add_argument('--fine_tuning', default=False, type=bool)
+    parser.add_argument('--finetune', default=False, type=bool)
 
     parser.add_argument('--debug', default=False, type=bool,
                         help="debug mode. skips validation loop throughout training")
@@ -413,13 +413,7 @@ def main():
     build_env(a.config, 'config.json', a.checkpoint_path)
 
     torch.manual_seed(h.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(h.seed)
-        h.num_gpus = torch.cuda.device_count()
-        h.batch_size = int(h.batch_size / h.num_gpus)
-        print('Batch size per GPU :', h.batch_size)
-    else:
-        pass
+    print('Batch size per GPU :', h.batch_size)
 
     if h.num_gpus > 1:
         mp.spawn(train, nprocs=h.num_gpus, args=(a, h,))

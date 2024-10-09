@@ -10,6 +10,7 @@ from torch.utils.data import Dataset
 import torchaudio
 import torchaudio.transforms as transforms
 
+MAX_WAV_VALUE = 32768.0
 
 class LogMelSpectrogram(torch.nn.Module):
     def __init__(self, num_mels=128, n_fft=1024, hop_size=160, win_size=1024):
@@ -46,6 +47,7 @@ class BaseDataset(Dataset):
         train: bool = True,
         finetune: bool = False,
     ):
+        root = Path(root)
         self.root = root
         self.wavs_dir = root / "wavs"
         self.mels_dir = root / "mels"
@@ -138,72 +140,6 @@ class MelDataset(BaseDataset):
             src_logmel = tgt_logmel.clone()
 
         return wav, src_logmel, tgt_logmel
-
-class HuBERTLabelDataset(BaseDataset):
-    def __init__(self, root: Path, 
-                 segment_length: int, 
-                 sample_rate: int, 
-                 hop_length: int, 
-                 train: bool = True, 
-                 sub_dirname: str = "30h_km",
-                 num_classes=2000,
-                 ):
-        super().__init__(root, segment_length, sample_rate, hop_length, train, False)
-        self.pad_idx = num_classes
-        file_path = "training.km" if train else "validation.km"
-        file_path = self.root / sub_dirname / file_path
-        with open(file_path, "r") as f:
-            self.km_labels = f.readlines()
-        assert len(self.km_labels) == len(self.metadata), f"{len(self.km_labels)=} does not match lines in tsv files." \
-                "Please check if they are on the same split."
-        
-    def __getitem__(self, index):
-        path = self.metadata[index]
-        wav_path = self.wavs_dir / path
-
-        info = torchaudio.info(wav_path.with_suffix(".wav"))
-        if info.sample_rate != self.sample_rate:
-            raise ValueError(
-                f"Sample rate {info.sample_rate} doesn't match target of {self.sample_rate}"
-            )
-        src_label = [int(x) for x in self.km_labels[index].strip().split(' ')]
-        label_frames_per_segment = math.ceil(self.segment_length / self.hop_length)
-        label_diff = len(src_label) - label_frames_per_segment if self.train else 0
-        label_offset = random.randint(0, max(label_diff, 0))
-
-        frame_offset = self.hop_length * label_offset
-
-        wav, _ = torchaudio.load(
-            wav_path.with_suffix(".wav"),
-            frame_offset=frame_offset if self.train else 0,
-            num_frames=self.segment_length if self.train else -1,
-        )
-
-        if wav.size(-1) < self.segment_length:
-            wav = F.pad(wav, (0, self.segment_length - wav.size(-1)))
-
-        if self.train:
-            gain = random.random() * (0.99 - 0.4) + 0.4
-            flip = -1 if random.random() > 0.5 else 1
-            wav = flip * gain * wav / max(wav.abs().max(), 1e-5)
-
-        tgt_logmel = self.logmel(wav.unsqueeze(0)).squeeze(0)
-        
-        if self.train:
-            src_label = src_label[
-                label_offset : label_offset + label_frames_per_segment
-            ]
-
-        src_label = torch.LongTensor(src_label)
-        if len(src_label) < label_frames_per_segment:
-            src_label = F.pad(
-                src_label,
-                (0, label_frames_per_segment - len(src_label)),
-                "constant",
-                self.pad_idx,
-            )
-
-        return wav, src_label.unsqueeze(0), tgt_logmel
     
 class LRS3MelDataset(Dataset):
     def __init__(
