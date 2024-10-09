@@ -1,205 +1,323 @@
-# Copyright (c) 2022 NVIDIA CORPORATION. 
-#   Licensed under the MIT license.
-
-# Adapted from https://github.com/jik876/hifi-gan under the MIT license.
-#   LICENSE is in incl_licenses directory.
-
+from pathlib import Path
 import math
-import os
 import random
-import torch
-import torch.utils.data
 import numpy as np
-from librosa.util import normalize
-from scipy.io.wavfile import read
-from librosa.filters import mel as librosa_mel_fn
-import pathlib
-from tqdm import tqdm
+import torch
+import torch.nn.functional as F
 
-MAX_WAV_VALUE = 32768.0
+from torch.utils.data import Dataset
 
-
-def load_wav(full_path, sr_target):
-    sampling_rate, data = read(full_path)
-    if sampling_rate != sr_target:
-        raise RuntimeError("Sampling rate of the file {} is {} Hz, but the model requires {} Hz".
-              format(full_path, sampling_rate, sr_target))
-    return data, sampling_rate
+import torchaudio
+import torchaudio.transforms as transforms
 
 
-def dynamic_range_compression(x, C=1, clip_val=1e-5):
-    return np.log(np.clip(x, a_min=clip_val, a_max=None) * C)
+class LogMelSpectrogram(torch.nn.Module):
+    def __init__(self, num_mels=128, n_fft=1024, hop_size=160, win_size=1024):
+        super().__init__()
+        self.n_fft=n_fft
+        self.hop_size=hop_size
+        self.melspctrogram = transforms.MelSpectrogram(
+            sample_rate=16000,
+            n_fft=self.n_fft,
+            win_length=win_size,
+            hop_length=self.hop_size,
+            center=False,
+            power=1.0,
+            norm="slaney",
+            onesided=True,
+            n_mels=num_mels,
+            mel_scale="slaney",
+        )
+
+    def forward(self, wav):
+        wav = F.pad(wav, ((self.n_fft-self.hop_size) // 2, (self.n_fft-self.hop_size) // 2), "reflect")
+        mel = self.melspctrogram(wav)
+        logmel = torch.log(torch.clamp(mel, min=1e-5))
+        return logmel
 
 
-def dynamic_range_decompression(x, C=1):
-    return np.exp(x) / C
+class BaseDataset(Dataset):
+    def __init__(
+        self,
+        root: Path,
+        segment_length: int,
+        sample_rate: int,
+        hop_length: int,
+        train: bool = True,
+        finetune: bool = False,
+    ):
+        self.root = root
+        self.wavs_dir = root / "wavs"
+        self.mels_dir = root / "mels"
+        self.data_dir = self.wavs_dir if not finetune else self.mels_dir
 
+        self.segment_length = segment_length
+        self.sample_rate = sample_rate
+        self.hop_length = hop_length
+        self.train = train
+        self.finetune = finetune
 
-def dynamic_range_compression_torch(x, C=1, clip_val=1e-5):
-    return torch.log(torch.clamp(x, min=clip_val) * C)
+        suffix = ".wav" if not finetune else ".npy"
+        file_path = "training.txt" if train else "validation.txt"
+        file_path = root / file_path
+        with open(file_path, "r") as f:
+            self.metadata = f.readlines()
+        self.metadata = [x.split("|")[0].strip()+suffix for x in self.metadata]
 
-
-def dynamic_range_decompression_torch(x, C=1):
-    return torch.exp(x) / C
-
-
-def spectral_normalize_torch(magnitudes):
-    output = dynamic_range_compression_torch(magnitudes)
-    return output
-
-
-def spectral_de_normalize_torch(magnitudes):
-    output = dynamic_range_decompression_torch(magnitudes)
-    return output
-
-
-mel_basis = {}
-hann_window = {}
-
-
-def mel_spectrogram(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin, fmax, center=False):
-    if torch.min(y) < -1.:
-        print('min value is ', torch.min(y))
-    if torch.max(y) > 1.:
-        print('max value is ', torch.max(y))
-
-    global mel_basis, hann_window
-    if fmax not in mel_basis:
-        mel = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax)
-        mel_basis[str(fmax)+'_'+str(y.device)] = torch.from_numpy(mel).float().to(y.device)
-        hann_window[str(y.device)] = torch.hann_window(win_size).to(y.device)
-
-    y = torch.nn.functional.pad(y.unsqueeze(1), (int((n_fft-hop_size)/2), int((n_fft-hop_size)/2)), mode='reflect')
-    y = y.squeeze(1)
-
-    # complex tensor as default, then use view_as_real for future pytorch compatibility
-    spec = torch.stft(y, n_fft, hop_length=hop_size, win_length=win_size, window=hann_window[str(y.device)],
-                      center=center, pad_mode='reflect', normalized=False, onesided=True, return_complex=True)
-    spec = torch.view_as_real(spec)
-    spec = torch.sqrt(spec.pow(2).sum(-1)+(1e-9))
-
-    spec = torch.matmul(mel_basis[str(fmax)+'_'+str(y.device)], spec)
-    spec = spectral_normalize_torch(spec)
-
-    return spec
-
-
-def get_dataset_filelist(a):
-    with open(a.input_training_file, 'r', encoding='utf-8') as fi:
-        fi.readline()
-        training_files = [x.split('\t')[0] for x in fi.readlines()]
-        print("first training file: {}".format(training_files[0]))
-
-    with open(a.input_validation_file, 'r', encoding='utf-8') as fi:
-        validation_files = [x.split('\t')[0] for x in fi.readlines()]
-        print("first validation file: {}".format(validation_files[0]))
-
-    return training_files, validation_files
-
-
-class MelDataset(torch.utils.data.Dataset):
-    def __init__(self, training_files, hparams, segment_size, n_fft, num_mels,
-                 hop_size, win_size, sampling_rate,  fmin, fmax, split=True, shuffle=True, n_cache_reuse=1,
-                 device=None, fmax_loss=None, fine_tuning=False, base_mels_path=None, is_seen=True):
-        self.audio_files = training_files
-        random.seed(1234)
-        if shuffle:
-            random.shuffle(self.audio_files)
-        self.hparams = hparams
-        self.is_seen = is_seen
-        if self.is_seen:
-            self.name = pathlib.Path(self.audio_files[0]).parts[0]
-        else:
-            self.name = '-'.join(pathlib.Path(self.audio_files[0]).parts[:2]).strip("/")
-
-        self.segment_size = segment_size
-        self.sampling_rate = sampling_rate
-        self.split = split
-        self.n_fft = n_fft
-        self.num_mels = num_mels
-        self.hop_size = hop_size
-        self.win_size = win_size
-        self.fmin = fmin
-        self.fmax = fmax
-        self.fmax_loss = fmax_loss
-        self.cached_wav = None
-        self.n_cache_reuse = n_cache_reuse
-        self._cache_ref_count = 0
-        self.device = device
-        self.fine_tuning = fine_tuning
-        self.base_mels_path = base_mels_path
-
-        # print("INFO: checking dataset integrity...")
-        # for i in tqdm(range(len(self.audio_files))):
-        #     assert os.path.exists(self.audio_files[i]), "{} not found".format(self.audio_files[i])
-
-    def __getitem__(self, index):
-
-        filename = self.audio_files[index]
-        if self._cache_ref_count == 0:
-            audio, sampling_rate = load_wav(filename, self.sampling_rate)
-            if np.issubdtype(audio.dtype, np.int16):
-                # The we we resample audio to 16kHz ensures this is not needed.
-                audio = audio / MAX_WAV_VALUE
-            if not self.fine_tuning:
-                audio = normalize(audio) * 0.95
-            self.cached_wav = audio
-            if sampling_rate != self.sampling_rate:
-                raise ValueError("{} SR doesn't match target {} SR".format(
-                    sampling_rate, self.sampling_rate))
-            self._cache_ref_count = self.n_cache_reuse
-        else:
-            audio = self.cached_wav
-            self._cache_ref_count -= 1
-
-        audio = torch.FloatTensor(audio)
-        audio = audio.unsqueeze(0)
-
-        if not self.fine_tuning:
-            if self.split:
-                if audio.size(1) >= self.segment_size:
-                    max_audio_start = audio.size(1) - self.segment_size
-                    audio_start = random.randint(0, max_audio_start)
-                    audio = audio[:, audio_start:audio_start+self.segment_size]
-                else:
-                    audio = torch.nn.functional.pad(audio, (0, self.segment_size - audio.size(1)), 'constant')
-
-                mel = mel_spectrogram(audio, self.n_fft, self.num_mels,
-                                      self.sampling_rate, self.hop_size, self.win_size, self.fmin, self.fmax,
-                                      center=False)
-            else: # validation step
-                # match audio length to self.hop_size * n for evaluation
-                if (audio.size(1) % self.hop_size) != 0:
-                    audio = audio[:, :-(audio.size(1) % self.hop_size)]
-                mel = mel_spectrogram(audio, self.n_fft, self.num_mels,
-                                      self.sampling_rate, self.hop_size, self.win_size, self.fmin, self.fmax,
-                                      center=False)
-                assert audio.shape[1] == mel.shape[2] * self.hop_size, "audio shape {} mel shape {}".format(audio.shape, mel.shape)
-
-        else:
-            mel = np.load(
-                os.path.join(self.base_mels_path, os.path.splitext(os.path.split(filename)[-1])[0] + '.npy'))
-            mel = torch.from_numpy(mel)
-
-            if len(mel.shape) < 3:
-                mel = mel.unsqueeze(0)
-
-            if self.split:
-                frames_per_seg = math.ceil(self.segment_size / self.hop_size)
-
-                if audio.size(1) >= self.segment_size:
-                    mel_start = random.randint(0, mel.size(2) - frames_per_seg - 1)
-                    mel = mel[:, :, mel_start:mel_start + frames_per_seg]
-                    audio = audio[:, mel_start * self.hop_size:(mel_start + frames_per_seg) * self.hop_size]
-                else:
-                    mel = torch.nn.functional.pad(mel, (0, frames_per_seg - mel.size(2)), 'constant')
-                    audio = torch.nn.functional.pad(audio, (0, self.segment_size - audio.size(1)), 'constant')
-
-        mel_loss = mel_spectrogram(audio, self.n_fft, self.num_mels,
-                                   self.sampling_rate, self.hop_size, self.win_size, self.fmin, self.fmax_loss,
-                                   center=False)
-
-        return (mel.squeeze(), audio.squeeze(0), filename, mel_loss.squeeze())
+        self.logmel = LogMelSpectrogram()
 
     def __len__(self):
-        return len(self.audio_files)
+        return len(self.metadata)
+
+class MelDataset(BaseDataset):
+    def __init__(
+        self,
+        root: Path,
+        segment_length: int,
+        sample_rate: int,
+        hop_length: int,
+        train: bool = True,
+        finetune: bool = False,
+    ):
+        super().__init__(root, segment_length, sample_rate, hop_length, train, finetune)
+
+    def __getitem__(self, index):
+        path = self.metadata[index]
+        wav_path = self.wavs_dir / path
+
+        info = torchaudio.info(wav_path.with_suffix(".wav"))
+        if info.sample_rate != self.sample_rate:
+            raise ValueError(
+                f"Sample rate {info.sample_rate} doesn't match target of {self.sample_rate}"
+            )
+
+        if self.finetune:
+            mel_path = self.mels_dir / path
+            src_logmel = torch.from_numpy(np.load(mel_path.with_suffix(".npy")))
+            src_logmel = src_logmel.unsqueeze(0)
+
+            mel_frames_per_segment = math.ceil(self.segment_length / self.hop_length)
+            mel_diff = src_logmel.size(-1) - mel_frames_per_segment if self.train else 0
+            mel_offset = random.randint(0, max(mel_diff, 0))
+
+            frame_offset = self.hop_length * mel_offset
+        else:
+            frame_diff = info.num_frames - self.segment_length
+            frame_offset = random.randint(0, max(frame_diff, 0))
+
+        wav, _ = torchaudio.load(
+            wav_path.with_suffix(".wav"),
+            frame_offset=frame_offset if self.train else 0,
+            num_frames=self.segment_length if self.train else -1,
+        )
+
+        if wav.size(-1) < self.segment_length:
+            wav = F.pad(wav, (0, self.segment_length - wav.size(-1)))
+
+        if not self.finetune and self.train:
+            gain = random.random() * (0.99 - 0.4) + 0.4
+            flip = -1 if random.random() > 0.5 else 1
+            wav = flip * gain * wav / max(wav.abs().max(), 1e-5)
+
+        tgt_logmel = self.logmel(wav.unsqueeze(0)).squeeze(0)
+
+        if self.finetune:
+            if self.train:
+                src_logmel = src_logmel[
+                    :, :, mel_offset : mel_offset + mel_frames_per_segment
+                ]
+
+            if src_logmel.size(-1) < mel_frames_per_segment:
+                src_logmel = F.pad(
+                    src_logmel,
+                    (0, mel_frames_per_segment - src_logmel.size(-1)),
+                    "constant",
+                    src_logmel.min(),
+                )
+        else:
+            src_logmel = tgt_logmel.clone()
+
+        return wav, src_logmel, tgt_logmel
+
+class HuBERTLabelDataset(BaseDataset):
+    def __init__(self, root: Path, 
+                 segment_length: int, 
+                 sample_rate: int, 
+                 hop_length: int, 
+                 train: bool = True, 
+                 sub_dirname: str = "30h_km",
+                 num_classes=2000,
+                 ):
+        super().__init__(root, segment_length, sample_rate, hop_length, train, False)
+        self.pad_idx = num_classes
+        file_path = "training.km" if train else "validation.km"
+        file_path = self.root / sub_dirname / file_path
+        with open(file_path, "r") as f:
+            self.km_labels = f.readlines()
+        assert len(self.km_labels) == len(self.metadata), f"{len(self.km_labels)=} does not match lines in tsv files." \
+                "Please check if they are on the same split."
+        
+    def __getitem__(self, index):
+        path = self.metadata[index]
+        wav_path = self.wavs_dir / path
+
+        info = torchaudio.info(wav_path.with_suffix(".wav"))
+        if info.sample_rate != self.sample_rate:
+            raise ValueError(
+                f"Sample rate {info.sample_rate} doesn't match target of {self.sample_rate}"
+            )
+        src_label = [int(x) for x in self.km_labels[index].strip().split(' ')]
+        label_frames_per_segment = math.ceil(self.segment_length / self.hop_length)
+        label_diff = len(src_label) - label_frames_per_segment if self.train else 0
+        label_offset = random.randint(0, max(label_diff, 0))
+
+        frame_offset = self.hop_length * label_offset
+
+        wav, _ = torchaudio.load(
+            wav_path.with_suffix(".wav"),
+            frame_offset=frame_offset if self.train else 0,
+            num_frames=self.segment_length if self.train else -1,
+        )
+
+        if wav.size(-1) < self.segment_length:
+            wav = F.pad(wav, (0, self.segment_length - wav.size(-1)))
+
+        if self.train:
+            gain = random.random() * (0.99 - 0.4) + 0.4
+            flip = -1 if random.random() > 0.5 else 1
+            wav = flip * gain * wav / max(wav.abs().max(), 1e-5)
+
+        tgt_logmel = self.logmel(wav.unsqueeze(0)).squeeze(0)
+        
+        if self.train:
+            src_label = src_label[
+                label_offset : label_offset + label_frames_per_segment
+            ]
+
+        src_label = torch.LongTensor(src_label)
+        if len(src_label) < label_frames_per_segment:
+            src_label = F.pad(
+                src_label,
+                (0, label_frames_per_segment - len(src_label)),
+                "constant",
+                self.pad_idx,
+            )
+
+        return wav, src_label.unsqueeze(0), tgt_logmel
+    
+class LRS3MelDataset(Dataset):
+    def __init__(
+        self,
+        root: Path,
+        segment_length: int,
+        sample_rate: int,
+        hop_length: int,
+        train: bool = True,
+        npy_postfix: str = None,
+    ):
+        self.root = root
+
+        self.segment_length = segment_length
+        self.sample_rate = sample_rate
+        self.hop_length = hop_length
+        self.train = train
+        self.finetune = npy_postfix is not None
+
+        file_path = "train.tsv" if train else "valid.tsv"
+        file_path = root / file_path
+        self.metadata, inds, tot, sizes = self.load_audio_visual_simple(file_path, 500, None)
+        self.metadata = [str(root.parent / "audio" / x.split("\t")[0].strip()) for x in self.metadata[1:]]
+        self.wav_paths = [x+'.wav' for x in self.metadata]
+        if self.finetune:
+            # expecting npy_postfix be like 433h_lrs3
+            self.mel_paths = [x+f"_{npy_postfix}.npy" for x in self.metadata]
+
+        self.logmel = LogMelSpectrogram()
+
+    def load_audio_visual_simple(self, manifest_path, max_keep, min_keep):
+        n_long, n_short = 0, 0
+        names, inds, sizes = [], [], []
+
+        with open(manifest_path) as f:
+            root = f.readline().strip()
+            for ind, line in enumerate(f):
+                items = line.strip().split("\t")
+                sz = int(items[-2]) # 
+                if min_keep is not None and sz < min_keep:
+                    n_short += 1
+                elif max_keep is not None and sz > max_keep:
+                    n_long += 1
+                else:
+                    audio_id = items[0]
+                    names.append(audio_id)
+                    inds.append(ind)
+                    sizes.append(sz)
+        tot = ind + 1
+        print(
+            (
+                f"max_keep={max_keep}, min_keep={min_keep}, "
+                f"loaded {len(names)}, skipped {n_short} short and {n_long} long, "
+                f"longest-loaded={max(sizes)}, shortest-loaded={min(sizes)}"
+            )
+        )
+        return names, inds, tot, sizes
+    
+    def __getitem__(self, index):
+        wav_path = self.wav_paths[index]
+
+        info = torchaudio.info(wav_path)
+        if info.sample_rate != self.sample_rate:
+            raise ValueError(
+                f"Sample rate {info.sample_rate} doesn't match target of {self.sample_rate}"
+            )
+
+        if self.finetune:
+            mel_path = self.mel_paths[index]
+            src_logmel = torch.from_numpy(np.load(mel_path))
+            src_logmel = src_logmel.unsqueeze(0)
+
+            mel_frames_per_segment = math.ceil(self.segment_length / self.hop_length)
+            mel_diff = src_logmel.size(-1) - mel_frames_per_segment if self.train else 0
+            mel_offset = random.randint(0, max(mel_diff, 0))
+
+            frame_offset = self.hop_length * mel_offset
+        else:
+            frame_diff = info.num_frames - self.segment_length
+            frame_offset = random.randint(0, max(frame_diff, 0))
+
+        wav, _ = torchaudio.load(
+            wav_path,
+            frame_offset=frame_offset if self.train else 0,
+            num_frames=self.segment_length if self.train else -1,
+        )
+
+        if wav.size(-1) < self.segment_length:
+            wav = F.pad(wav, (0, self.segment_length - wav.size(-1)))
+
+        if not self.finetune and self.train:
+            gain = random.random() * (0.99 - 0.4) + 0.4
+            flip = -1 if random.random() > 0.5 else 1
+            wav = flip * gain * wav / max(wav.abs().max(), 1e-5)
+
+        tgt_logmel = self.logmel(wav.unsqueeze(0)).squeeze(0)
+
+        if self.finetune:
+            if self.train:
+                src_logmel = src_logmel[
+                    :, :, mel_offset : mel_offset + mel_frames_per_segment
+                ]
+
+            if src_logmel.size(-1) < mel_frames_per_segment:
+                src_logmel = F.pad(
+                    src_logmel,
+                    (0, mel_frames_per_segment - src_logmel.size(-1)),
+                    "constant",
+                    src_logmel.min(),
+                )
+        else:
+            src_logmel = tgt_logmel.clone()
+
+        return wav, src_logmel, tgt_logmel
+    
+    def __len__(self):
+        return len(self.metadata)
