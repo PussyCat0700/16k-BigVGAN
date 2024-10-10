@@ -162,16 +162,19 @@ def train(rank, a, h):
             print("step {} {} speaker validation...".format(steps, mode))
 
             # loop over validation set and compute metrics
-            for j, batch in tqdm(enumerate(loader)):
+            for j, batch in enumerate(tqdm(loader)):
                 y, x, y_mel = batch
                 y = y.to(device)
                 x = x.squeeze(1)
+                y = y.squeeze(1)
+                y_mel = y_mel.squeeze(1)
                 if hasattr(generator, 'module'):
                     y_g_hat = generator.module(x.to(device))
                 else:
                     y_g_hat = generator(x.to(device))
+                y_g_hat = y_g_hat.squeeze(1)
                 y_mel = y_mel.to(device, non_blocking=True)
-                y_g_hat_mel = logmel(y_g_hat).squeeze(1)
+                y_g_hat_mel = logmel(y_g_hat)
                 val_err_tot += F.l1_loss(y_mel, y_g_hat_mel).item()
 
                 # PESQ calculation. only evaluate PESQ if it's speech signal (nonspeech PESQ will error out)
@@ -179,10 +182,10 @@ def train(rank, a, h):
                     if h.sampling_rate != 16000:
                         # resample to 16000 for pesq
                         y_16k = pesq_resampler(y)
-                        y_g_hat_16k = pesq_resampler(y_g_hat.squeeze(1))
+                        y_g_hat_16k = pesq_resampler(y_g_hat)
                     else:
                         y_16k = y
-                        y_g_hat_16k = y_g_hat.squeeze(1)
+                        y_g_hat_16k = y_g_hat
                     y_int_16k = (y_16k[0] * MAX_WAV_VALUE).short().cpu().numpy()
                     y_g_hat_int_16k = (y_g_hat_16k[0] * MAX_WAV_VALUE).short().cpu().numpy()
                     val_pesq_tot += pesq(16000, y_int_16k, y_g_hat_int_16k, 'wb')
@@ -200,9 +203,9 @@ def train(rank, a, h):
 
                     sw.add_audio('generated_{}/y_hat_{}'.format(mode, j), y_g_hat[0], steps, h.sampling_rate)
                     if a.save_audio: # also save audio to disk if --save_audio is set to True
-                        save_audio(y_g_hat[0, 0], os.path.join(a.checkpoint_path, 'samples', '{}_{:08d}'.format(mode, steps), '{:04d}.wav'.format(j)), h.sampling_rate)
+                        save_audio(y_g_hat[0], os.path.join(a.checkpoint_path, 'samples', '{}_{:08d}'.format(mode, steps), '{:04d}.wav'.format(j)), h.sampling_rate)
                     # spectrogram of synthesized audio
-                    y_hat_spec = logmel(y_g_hat.squeeze(1))
+                    y_hat_spec = logmel(y_g_hat)
                     sw.add_figure('generated_{}/y_hat_spec_{}'.format(mode, j),
                                   plot_spectrogram(y_hat_spec.squeeze(0).cpu().numpy()), steps)
                     # visualization of spectrogram difference between GT and synthesized audio
@@ -224,8 +227,7 @@ def train(rank, a, h):
     # if the checkpoint is loaded, start with validation loop
     if steps != 0 and rank == 0 and not a.debug:
         if not a.skip_seen:
-            validate(rank, a, h, validation_loader,
-                     mode="seen_{}".format(train_loader.dataset.name))
+            validate(rank, a, h, validation_loader,)
     # exit the script if --evaluate is set to True
     if a.evaluate:
         exit()
@@ -246,7 +248,7 @@ def train(rank, a, h):
         if h.num_gpus > 1:
             train_sampler.set_epoch(epoch)
 
-        for i, batch in enumerate(train_loader):
+        for i, batch in enumerate(tqdm(train_loader)):
             if rank == 0:
                 start_b = time.time()
             y, x, y_mel = batch
@@ -255,6 +257,7 @@ def train(rank, a, h):
             y = y.to(device, non_blocking=True)
             y_mel = y_mel.to(device, non_blocking=True)
             x = x.squeeze(1)
+            y_mel = y_mel.squeeze(1)
             y_g_hat = generator(x)
             y_g_hat_mel = logmel(y_g_hat).squeeze(1)
 
@@ -356,8 +359,7 @@ def train(rank, a, h):
 
                     # seen and unseen speakers validation loops
                     if not a.debug and steps != 0:
-                        validate(rank, a, h, validation_loader,
-                                 mode="seen_{}".format(train_loader.dataset.name))
+                        validate(rank, a, h, validation_loader,)
             steps += 1
 
         scheduler_g.step()
@@ -391,13 +393,13 @@ def main():
 
     parser.add_argument('--debug', default=False, type=bool,
                         help="debug mode. skips validation loop throughout training")
-    parser.add_argument('--evaluate', default=False, type=bool,
+    parser.add_argument('--evaluate', action='store_true',
                         help="only run evaluation from checkpoint and exit")
     parser.add_argument('--eval_subsample', default=5, type=int,
                         help="subsampling during evaluation loop")
     parser.add_argument('--skip_seen', default=False, type=bool,
                         help="skip seen dataset. useful for test set inference")
-    parser.add_argument('--save_audio', default=False, type=bool,
+    parser.add_argument('--save_audio', action='store_true',
                         help="save audio of test set inference to disk")
     parser.add_argument( "--wandb", action="store_true",
                         help="enable wandb")
