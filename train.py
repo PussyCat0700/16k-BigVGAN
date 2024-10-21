@@ -21,7 +21,7 @@ import torch.multiprocessing as mp
 from torch.distributed import init_process_group
 from torch.nn.parallel import DistributedDataParallel
 from env import AttrDict, build_env
-from meldataset import MelDataset, LogMelSpectrogram, MAX_WAV_VALUE
+from meldataset import LRS3MelDataset, MelDataset, LogMelSpectrogram, MAX_WAV_VALUE
 from models import BigVGAN, MultiPeriodDiscriminator, MultiResolutionDiscriminator,\
     feature_loss, generator_loss, discriminator_loss
 from utils import plot_spectrogram, plot_spectrogram_clipped, scan_checkpoint, load_checkpoint, save_checkpoint, save_audio
@@ -63,11 +63,13 @@ def train(rank, a, h):
     # create or scan the latest checkpoint from checkpoints directory
     if rank == 0:
         os.makedirs(a.checkpoint_path, exist_ok=True)
+        if os.path.isdir(a.checkpoint_path):
+            cp_g = scan_checkpoint(a.checkpoint_path, 'g_')
+            cp_do = scan_checkpoint(a.checkpoint_path, 'do_')
+        if a.finetune:
+            a.checkpoint_path = os.path.join(a.checkpoint_path, 'finetuned')
+            os.makedirs(a.checkpoint_path, exist_ok=False)
         print("checkpoints directory : ", a.checkpoint_path)
-
-    if os.path.isdir(a.checkpoint_path):
-        cp_g = scan_checkpoint(a.checkpoint_path, 'g_')
-        cp_do = scan_checkpoint(a.checkpoint_path, 'do_')
 
     # load the latest checkpoint if exists
     steps = 0
@@ -108,6 +110,24 @@ def train(rank, a, h):
         segment_length=h.segment_size,
         sample_rate=h.sampling_rate,
     )
+    if not a.with_lrs3:
+        trainset = MelDataset(
+            finetune=a.finetune,
+            hop_length=h.hop_size,
+            train=True,
+            root=a.dataset_dir,
+            segment_length=h.segment_size,
+            sample_rate=h.sampling_rate,
+        )
+    else:
+        trainset = LRS3MelDataset(
+            npy_postfix=a.npy,
+            hop_length=h.hop_size,
+            train=True,
+            root=a.dataset_dir,
+            segment_length=h.segment_size,
+            sample_rate=h.sampling_rate,
+        )
 
     train_sampler = DistributedSampler(trainset) if h.num_gpus > 1 else None
 
@@ -118,8 +138,18 @@ def train(rank, a, h):
                               drop_last=True)
 
     if rank == 0:
-        validset = MelDataset(
+        if not a.with_lrs3:
+            validset = MelDataset(
                 finetune=a.finetune,
+                hop_length=h.hop_size,
+                train=False,
+                root=a.dataset_dir,
+                segment_length=h.segment_size,
+                sample_rate=h.sampling_rate,
+            )
+        else:
+            validset = LRS3MelDataset(
+                npy_postfix=a.npy,
                 hop_length=h.hop_size,
                 train=False,
                 root=a.dataset_dir,
@@ -390,6 +420,7 @@ def main():
                         help='freeze D for the first specified steps. G only uses regression loss for these steps.')
 
     parser.add_argument('--finetune', default=False, type=bool)
+    parser.add_argument("--npy", help=".npy file postfix saved in LRS3")
 
     parser.add_argument('--debug', default=False, type=bool,
                         help="debug mode. skips validation loop throughout training")
@@ -405,6 +436,7 @@ def main():
                         help="enable wandb")
 
     a = parser.parse_args()
+    a.with_lrs3 = 'lrs3' in str(a.dataset_dir) or 'lrs2' in str(a.dataset_dir)
 
     with open(a.config) as f:
         data = f.read()
