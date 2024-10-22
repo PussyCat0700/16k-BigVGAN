@@ -68,7 +68,7 @@ def train(rank, a, h):
             cp_do = scan_checkpoint(a.checkpoint_path, 'do_')
         if a.finetune:
             a.checkpoint_path = os.path.join(a.checkpoint_path, 'finetuned')
-            os.makedirs(a.checkpoint_path, exist_ok=False)
+            os.makedirs(a.checkpoint_path, exist_ok=True)
         print("checkpoints directory : ", a.checkpoint_path)
 
     # load the latest checkpoint if exists
@@ -84,6 +84,9 @@ def train(rank, a, h):
         mrd.load_state_dict(state_dict_do['mrd'])
         steps = state_dict_do['steps'] + 1
         last_epoch = state_dict_do['epoch']
+    
+    if a.finetune:
+        steps, last_epoch = 0, -1
 
     # initialize DDP, optimizers, and schedulers
     if h.num_gpus > 1:
@@ -102,14 +105,6 @@ def train(rank, a, h):
     scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=h.lr_decay, last_epoch=last_epoch)
     scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=h.lr_decay, last_epoch=last_epoch)
 
-    trainset = MelDataset(
-        finetune=a.finetune,
-        hop_length=h.hop_size,
-        train=True,
-        root=a.dataset_dir,
-        segment_length=h.segment_size,
-        sample_rate=h.sampling_rate,
-    )
     if not a.with_lrs3:
         trainset = MelDataset(
             finetune=a.finetune,
@@ -205,7 +200,9 @@ def train(rank, a, h):
                 y_g_hat = y_g_hat.squeeze(1)
                 y_mel = y_mel.to(device, non_blocking=True)
                 y_g_hat_mel = logmel(y_g_hat)
-                val_err_tot += F.l1_loss(y_mel, y_g_hat_mel).item()
+                length = min(y_g_hat_mel.size(-1), y_mel.size(-1))
+                loss_mel = F.l1_loss(y_g_hat_mel[..., :length], y_mel[..., :length])
+                val_err_tot += loss_mel.item()
 
                 # PESQ calculation. only evaluate PESQ if it's speech signal (nonspeech PESQ will error out)
                 if not "nonspeech" in mode: # skips if the name of dataset (in mode string) contains "nonspeech"
@@ -419,7 +416,7 @@ def main():
     parser.add_argument('--freeze_step', default=0, type=int,
                         help='freeze D for the first specified steps. G only uses regression loss for these steps.')
 
-    parser.add_argument('--finetune', default=False, type=bool)
+    parser.add_argument('--finetune', action='store_true')
     parser.add_argument("--npy", help=".npy file postfix saved in LRS3")
 
     parser.add_argument('--debug', default=False, type=bool,

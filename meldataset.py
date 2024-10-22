@@ -144,13 +144,14 @@ class MelDataset(BaseDataset):
 class LRS3MelDataset(Dataset):
     def __init__(
         self,
-        root: Path,
+        root: str,
         segment_length: int,
         sample_rate: int,
         hop_length: int,
         train: bool = True,
         npy_postfix: str = None,
     ):
+        root = Path(root)
         self.root = root
 
         self.segment_length = segment_length
